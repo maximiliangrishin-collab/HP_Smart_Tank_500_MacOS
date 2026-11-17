@@ -13,6 +13,7 @@ System Settings > Printers & Scanners can use it without any driver.
     scanbridge.py --test FILE  scan one A4 page (300 dpi, colour) to FILE.jpg
 """
 import argparse
+import http.client
 import os
 import re
 import signal
@@ -31,6 +32,7 @@ import usb.backend.libusb1 as libusb1  # noqa: E402
 HP_VID = 0x03F0
 IPP_USB = (7, 1, 4)
 LIBUSB = os.environ.get("HP520_LIBUSB", os.path.join(HERE, "libusb-1.0.dylib"))
+VERBOSE = False
 HOP = {"host", "connection", "content-length", "transfer-encoding", "keep-alive",
        "accept-encoding", "te", "upgrade", "proxy-connection", "expect"}
 NS = "http://schemas.hp.com/imaging/escl/2011/05/03"
@@ -106,7 +108,7 @@ class UsbHttp:
             raise LookupError("no HP printer with an IPP-over-USB interface found")
         self.dev, intf = found
         self.iface = intf.bInterfaceNumber
-        self.desc = "interface %d alt %d (%02x/%02x/%02x)" % ((intf.bInterfaceNumber, intf.bAlternateSetting) + cls(intf))
+        self.desc = "USB interface %d alt %d (%02x/%02x/%02x)" % ((intf.bInterfaceNumber, intf.bAlternateSetting) + cls(intf))
 
         def bulk(direction):
             return usb.util.find_descriptor(intf, custom_match=lambda e:
@@ -200,6 +202,51 @@ class UsbHttp:
         return status, reason, hdrs, body
 
 
+class HttpUpstream:
+    """Forward to an existing eSCL HTTP server, e.g. macOS' own ippusbd proxy."""
+
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.desc = f"upstream http://{host}:{port}"
+
+    def close(self):
+        pass
+
+    def request(self, method, path, headers=None, body=b"", limit=240):
+        hdrs = {k: v for k, v in (headers or {}).items() if k.lower() not in HOP}
+        hdrs["Host"] = f"{self.host}:{self.port}"
+        c = http.client.HTTPConnection(self.host, self.port, timeout=limit)
+        try:
+            c.request(method, path, body=body or None, headers=hdrs)
+            r = c.getresponse()
+            data = r.read()
+            return r.status, r.reason, list(r.getheaders()), data
+        finally:
+            c.close()
+
+
+def find_native_scanner(wait=4):
+    """Find the eSCL scanner that macOS (ippusbd) announces for a USB HP printer."""
+    def run(args):
+        try:
+            p = subprocess.run(args, capture_output=True, text=True, timeout=wait)
+            return p.stdout
+        except subprocess.TimeoutExpired as e:
+            return (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+    names = []
+    for line in run(["dns-sd", "-B", "_uscan._tcp", "local."]).splitlines():
+        m = re.search(r"\sAdd\s+\d+\s+-?\d+\s+\S+\s+_uscan\._tcp\.\s+(.+)$", line)
+        if m and not m.group(1).endswith("(USB)") and m.group(1) not in names:
+            names.append(m.group(1))
+    for name in names:
+        out = run(["dns-sd", "-L", name, "_uscan._tcp", "local."])
+        m = re.search(r"can be reached at (\S+?)\.?:(\d+)", out)
+        if m and "usb_VID=1008" in out:
+            host = "127.0.0.1" if m.group(1).rstrip(".") in ("localhost",) else m.group(1).rstrip(".")
+            return host, int(m.group(2)), name
+    return None
+
+
 def scanner_info(u):
     """Read ScannerCapabilities and derive the Bonjour TXT record from it."""
     st, _, _, xml = u.request("GET", "/eSCL/ScannerCapabilities")
@@ -288,6 +335,8 @@ def serve(u, port, lan):
                     self.rfile.readline()
             elif self.headers.get("Content-Length"):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
+            if VERBOSE and body:
+                log(f"  > {self.command} {self.path} body: " + re.sub(r"\s+", " ", body.decode("utf-8", "replace"))[:1500])
             try:
                 st, reason, hdrs, rb = u.request(self.command, self.path, dict(self.headers), body)
             except UsbGone as e:
@@ -300,6 +349,10 @@ def serve(u, port, lan):
                 log(f"error on {self.command} {self.path}: {e}")
                 self.send_error(504, "printer did not answer")
                 return
+            if VERBOSE:
+                ctype = dict((k.lower(), v) for k, v in hdrs).get("content-type", "")
+                log(f"  < {st} {reason} {ctype} {len(rb)} bytes"
+                    + (": " + re.sub(r"\s+", " ", rb.decode("utf-8", "replace"))[:800] if st >= 400 or "xml" in ctype and self.command == "POST" else ""))
             self.send_response(st, reason)
             host = self.headers.get("Host") or f"127.0.0.1:{port}"
             for k, v in hdrs:
@@ -327,7 +380,7 @@ def serve(u, port, lan):
     adv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if threading.current_thread() is threading.main_thread():  # launchd stops us with SIGTERM
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
-    log(f"bridge up: '{name}' at http://{addr}:{port}/eSCL via USB {u.desc}")
+    log(f"bridge up: '{name}' at http://{addr}:{port}/eSCL via {u.desc}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -376,7 +429,27 @@ def main():
     ap.add_argument("--test", metavar="FILE", help="scan one A4 page to FILE (JPEG) and exit")
     ap.add_argument("--lan", action="store_true", help="share the scanner with the local network")
     ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--upstream", metavar="HOST:PORT|auto",
+                    help="diagnostics: forward to an eSCL server instead of USB; 'auto' finds macOS' ippusbd scanner")
+    ap.add_argument("-v", "--verbose", action="store_true", help="log request and error bodies")
     a = ap.parse_args()
+    global VERBOSE
+    VERBOSE = a.verbose
+    if a.upstream:
+        if a.upstream == "auto":
+            found = find_native_scanner()
+            if not found:
+                sys.exit("macOS does not announce an eSCL scanner for a USB HP printer")
+            host, port, name = found
+            log(f"macOS scanner '{name}' at {host}:{port}")
+        else:
+            host, _, port = a.upstream.rpartition(":")
+            port = int(port)
+        u = HttpUpstream(host, port)
+        if a.test:
+            test_scan(u, a.test)
+            return 0
+        return serve(u, a.port, a.lan)
     if not a.test:
         redirect_log()
     try:
