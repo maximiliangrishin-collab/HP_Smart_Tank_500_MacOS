@@ -69,6 +69,11 @@ for example if the printer was not connected during installation),
   `python3 -I /Library/Printers/HPSmartTank520/scan/scanbridge.py --test ~/Desktop/scan.jpg`
   (stop the bridge first: `launchctl bootout gui/$(id -u)/org.hp520-macos.scanbridge`;
   start it again with `launchctl bootstrap gui/$(id -u) /Library/LaunchAgents/org.hp520-macos.scanbridge.plist`).
+* **Log says the interfaces are busy (`ippusbd`).** macOS' own IPP-over-USB daemon grabs the
+  printer when an old queue created in *Printers & Scanners* (AirPrint/IPP) still exists, often with a
+  stuck job. That queue can never work with this printer. Remove it: `lpstat -p` to find its name,
+  then `cancel -a <name>` and `sudo lpadmin -x <name>`. The bridge itself uses HP's vendor eSCL
+  interface, which `ippusbd` does not claim.
 * **The print queue was not created.** The printer was not visible on USB:
   connect it and run `./install.sh --queue-only`.
 * **Black or a colour is missing even in a copy made on the printer itself.**

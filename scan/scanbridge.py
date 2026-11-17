@@ -30,6 +30,7 @@ import usb.backend.libusb1 as libusb1  # noqa: E402
 
 HP_VID = 0x03F0
 IPP_USB = (7, 1, 4)
+HP_ESCL = (0xFF, 4, 1)  # HP vendor interface that serves the same eSCL HTTP API
 LIBUSB = os.environ.get("HP520_LIBUSB", os.path.join(HERE, "libusb-1.0.dylib"))
 HOP = {"host", "connection", "content-length", "transfer-encoding", "keep-alive",
        "accept-encoding", "te", "upgrade", "proxy-connection", "expect"}
@@ -68,30 +69,51 @@ class UsbHttp:
         backend = libusb1.get_backend(find_library=lambda _: LIBUSB)
         if backend is None:
             sys.exit(f"cannot load libusb from {LIBUSB}")
-        found = None
+        def cls(i):
+            return (i.bInterfaceClass, i.bInterfaceSubClass, i.bInterfaceProtocol)
+
+        errors, found = [], None
         for dev in usb.core.find(find_all=True, idVendor=HP_VID, backend=backend):
             try:
-                cfg = dev.get_active_configuration()
+                alts = list(dev.get_active_configuration())
             except usb.core.USBError:
                 continue
-            for intf in cfg:
-                if (intf.bInterfaceClass, intf.bInterfaceSubClass, intf.bInterfaceProtocol) == IPP_USB:
-                    found = (dev, intf)
-                    break
+            ipp = {i.bInterfaceNumber for i in alts if cls(i) == IPP_USB}
+            # 1) HP's vendor eSCL interface, which macOS' own ippusbd never claims;
+            # 2) the IPP-over-USB interfaces, which ippusbd may already hold.
+            order = [i for i in alts if cls(i) == HP_ESCL and i.bInterfaceNumber not in ipp]
+            order += [i for i in alts if cls(i) == IPP_USB]
+            for intf in order:
+                try:
+                    usb.util.claim_interface(dev, intf.bInterfaceNumber)
+                except usb.core.USBError as e:
+                    errors.append(f"interface {intf.bInterfaceNumber}: {e.strerror or e}")
+                    continue
+                try:
+                    intf.set_altsetting()
+                except usb.core.USBError as e:
+                    usb.util.release_interface(dev, intf.bInterfaceNumber)
+                    errors.append(f"interface {intf.bInterfaceNumber} alt {intf.bAlternateSetting}: {e.strerror or e}")
+                    continue
+                found = (dev, intf)
+                break
             if found:
                 break
         if not found:
-            raise LookupError("no HP printer with an IPP-over-USB interface found")
+            hint = " (busy: another process, e.g. macOS ippusbd, holds the interfaces)" if errors else ""
+            raise LookupError("no usable scan interface on an HP printer" + hint + (": " + "; ".join(errors) if errors else ""))
         self.dev, intf = found
         self.iface = intf.bInterfaceNumber
-        usb.util.claim_interface(self.dev, self.iface)
-        intf.set_altsetting()
+        self.desc = "interface %d alt %d (%02x/%02x/%02x)" % ((intf.bInterfaceNumber, intf.bAlternateSetting) + cls(intf))
 
         def bulk(direction):
             return usb.util.find_descriptor(intf, custom_match=lambda e:
                 usb.util.endpoint_direction(e.bEndpointAddress) == direction and
                 usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK)
         self.OUT, self.IN = bulk(usb.util.ENDPOINT_OUT), bulk(usb.util.ENDPOINT_IN)
+        if self.OUT is None or self.IN is None:
+            self.close()
+            raise LookupError(f"{self.desc} has no bulk endpoints")
         self.lock = threading.Lock()
         self.drain(1.0)
 
@@ -303,7 +325,7 @@ def serve(u, port, lan):
     adv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if threading.current_thread() is threading.main_thread():  # launchd stops us with SIGTERM
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
-    log(f"bridge up: '{name}' at http://{addr}:{port}/eSCL")
+    log(f"bridge up: '{name}' at http://{addr}:{port}/eSCL via USB {u.desc}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -342,7 +364,8 @@ def main():
     except LookupError as e:
         if a.test:
             sys.exit(str(e))
-        time.sleep(20)  # printer off or unplugged: launchd will start us again
+        log(str(e))
+        time.sleep(30)  # printer off, unplugged or busy: launchd will start us again
         sys.exit(0)
     try:
         if a.test:
