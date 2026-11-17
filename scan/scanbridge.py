@@ -34,6 +34,7 @@ HP_VID = 0x03F0
 IPP_USB = (7, 1, 4)
 LIBUSB = os.environ.get("HP520_LIBUSB", os.path.join(HERE, "libusb-1.0.dylib"))
 VERBOSE = False
+FIRST_BYTE_TIMEOUT = 180  # generous: a 1200 dpi page may take a while before the first byte
 LOG_DIR = "/Library/Logs" if os.geteuid() == 0 else os.path.expanduser("~/Library/Logs")
 IPPUSB_JOB = "com.apple.print.ippusb."
 HOP = {"host", "connection", "content-length", "transfer-encoding", "keep-alive",
@@ -78,6 +79,7 @@ class UsbHttp:
         backend = libusb1.get_backend(find_library=lambda _: LIBUSB)
         if backend is None:
             sys.exit(f"cannot load libusb from {LIBUSB}")
+        self.backend = backend
         def cls(i):
             return (i.bInterfaceClass, i.bInterfaceSubClass, i.bInterfaceProtocol)
 
@@ -137,6 +139,20 @@ class UsbHttp:
         self.lock = threading.Lock()
         self.drain(1.0)
 
+    def present(self):
+        """False once the printer we opened has gone (unplugged, switched off, re-enumerated)."""
+        try:
+            self.dev.ctrl_transfer(0x80, 0, 0, 0, 2, timeout=2000)  # GET_STATUS on our own handle
+        except usb.core.USBTimeoutError:
+            pass
+        except usb.core.USBError:
+            return False
+        try:
+            return any((d.bus, d.address) == (self.dev.bus, self.dev.address)
+                       for d in usb.core.find(find_all=True, idVendor=HP_VID, backend=self.backend))
+        except usb.core.USBError:
+            return True
+
     def close(self):
         try:
             for n in self.extra:
@@ -183,6 +199,8 @@ class UsbHttp:
                     last = time.time()
             except usb.core.USBTimeoutError:
                 chunk = None
+            if not buf and time.time() - t0 > FIRST_BYTE_TIMEOUT:
+                raise TimeoutError(f"no answer from the printer to {method} {path} within {FIRST_BYTE_TIMEOUT} s")
             if head is None and b"\r\n\r\n" in buf:
                 k = buf.index(b"\r\n\r\n")
                 head, rest = bytes(buf[:k]).decode("latin-1"), k + 4
@@ -422,6 +440,16 @@ def serve(u, port, lan):
         cmd = ["dns-sd", "-P", name, "_uscan._tcp", "local", str(port),
                "hp520-scanbridge.local", "127.0.0.1"] + record
     adv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def watchdog():
+        while True:
+            time.sleep(3)
+            if not u.present():
+                log("printer disconnected; exiting so that launchd starts the bridge again")
+                adv.terminate()
+                os._exit(1)  # request threads may be stuck in USB calls: do not wait for them
+    if hasattr(u, "present"):
+        threading.Thread(target=watchdog, daemon=True).start()
     if threading.current_thread() is threading.main_thread():  # launchd stops us with SIGTERM
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
     log(f"bridge up: '{name}' at http://{addr}:{port}/eSCL via {u.desc}")
