@@ -24,9 +24,10 @@ No HP software, no paid apps, no binary blobs.
 
 ## Requirements
 
-* macOS on Apple silicon or Intel. Tested on macOS 27.0.1 (Apple silicon) with
-  printer firmware `LAP1CN2446AR`. Intel Macs and older macOS versions are
-  expected to work but are untested.
+* macOS on Apple silicon or Intel. Tested on Apple silicon with macOS 15.7.3 (full
+  installation: printing, scanning, unplugging and replugging the printer) and macOS 27.0.1,
+  printer firmware `LAP1CN2446AR`. Intel Macs and macOS versions before 15 are expected to
+  work but are untested.
 * **Command Line Tools** (the installer offers to install them; about 1 GB).
 * An administrator password.
 * Internet access during installation (libusb and libjpeg are downloaded and
