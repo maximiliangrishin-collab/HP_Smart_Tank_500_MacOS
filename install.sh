@@ -147,12 +147,12 @@ if [ "$DO_SCAN" = 1 ]; then
   printf 'waiting for the scanner'
   for _ in $(seq 1 15); do
     if curl -fs "http://127.0.0.1:$PORT/eSCL/ScannerStatus" >/dev/null 2>&1; then
-      printf '\nscanner is up: open Image Capture and pick "Smart Tank 520_540 series (USB)"\n'; break
+      printf "\nbridge scanner is up: open Image Capture\n"; break
     fi
     printf '.'; sleep 2
   done
   curl -fs "http://127.0.0.1:$PORT/eSCL/ScannerStatus" >/dev/null 2>&1 || \
-    printf '\nthe scanner is not answering yet (printer off or unplugged?). It starts by itself once the printer is connected.\nLog: ~/Library/Logs/hp520-scanbridge.log\n'
+    printf '\nthe bridge is idle: either macOS provides the scanner itself (pick "HP Smart Tank 520_540 series"\nin Image Capture) or the printer is off/unplugged. Log: ~/Library/Logs/hp520-scanbridge.log\n'
 fi
 
 step "Done"

@@ -30,7 +30,6 @@ import usb.backend.libusb1 as libusb1  # noqa: E402
 
 HP_VID = 0x03F0
 IPP_USB = (7, 1, 4)
-HP_ESCL = (0xFF, 4, 1)  # HP vendor interface that serves the same eSCL HTTP API
 LIBUSB = os.environ.get("HP520_LIBUSB", os.path.join(HERE, "libusb-1.0.dylib"))
 HOP = {"host", "connection", "content-length", "transfer-encoding", "keep-alive",
        "accept-encoding", "te", "upgrade", "proxy-connection", "expect"}
@@ -39,6 +38,11 @@ NS = "http://schemas.hp.com/imaging/escl/2011/05/03"
 
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+class Busy(LookupError):
+    """The IPP-over-USB interfaces are held by another process, normally macOS'
+    own /usr/libexec/ippusbd, which then provides the scanner itself."""
 
 
 class UsbGone(Exception):
@@ -78,12 +82,9 @@ class UsbHttp:
                 alts = list(dev.get_active_configuration())
             except usb.core.USBError:
                 continue
-            ipp = {i.bInterfaceNumber for i in alts if cls(i) == IPP_USB}
-            # 1) HP's vendor eSCL interface, which macOS' own ippusbd never claims;
-            # 2) the IPP-over-USB interfaces, which ippusbd may already hold.
-            order = [i for i in alts if cls(i) == HP_ESCL and i.bInterfaceNumber not in ipp]
-            order += [i for i in alts if cls(i) == IPP_USB]
-            for intf in order:
+            # Only IPP-over-USB interfaces: HP's vendor interface ff/04/01 answers
+            # eSCL GET requests but never accepts scan jobs.
+            for intf in [i for i in alts if cls(i) == IPP_USB]:
                 try:
                     usb.util.claim_interface(dev, intf.bInterfaceNumber)
                 except usb.core.USBError as e:
@@ -100,8 +101,9 @@ class UsbHttp:
             if found:
                 break
         if not found:
-            hint = " (busy: another process, e.g. macOS ippusbd, holds the interfaces)" if errors else ""
-            raise LookupError("no usable scan interface on an HP printer" + hint + (": " + "; ".join(errors) if errors else ""))
+            if errors:
+                raise Busy("IPP-over-USB interfaces are in use by another process: " + "; ".join(errors))
+            raise LookupError("no HP printer with an IPP-over-USB interface found")
         self.dev, intf = found
         self.iface = intf.bInterfaceNumber
         self.desc = "interface %d alt %d (%02x/%02x/%02x)" % ((intf.bInterfaceNumber, intf.bAlternateSetting) + cls(intf))
@@ -336,6 +338,24 @@ def serve(u, port, lan):
     return 1 if state["gone"] else 0
 
 
+def log_once(msg):
+    """Log a repeating idle message only when it changes."""
+    state = os.path.expanduser("~/Library/Logs/.hp520-scanbridge.state")
+    try:
+        with open(state) as f:
+            last = f.read()
+    except OSError:
+        last = None
+    if msg != last:
+        if msg:
+            log(msg)
+        try:
+            with open(state, "w") as f:
+                f.write(msg)
+        except OSError:
+            pass
+
+
 def redirect_log():
     """Under launchd there is no terminal: write to ~/Library/Logs instead."""
     if sys.stdout.isatty():
@@ -364,9 +384,16 @@ def main():
     except LookupError as e:
         if a.test:
             sys.exit(str(e))
-        log(str(e))
-        time.sleep(30)  # printer off, unplugged or busy: launchd will start us again
+        if isinstance(e, Busy):
+            msg = ("macOS' own IPP-over-USB service (ippusbd) holds the printer and announces "
+                   "the scanner itself; the bridge stays idle. (" + str(e) + ")")
+            pause = 120
+        else:
+            msg, pause = str(e), 30
+        log_once(msg)
+        time.sleep(pause)  # launchd starts us again and we look once more
         sys.exit(0)
+    log_once("")
     try:
         if a.test:
             test_scan(u, a.test)
