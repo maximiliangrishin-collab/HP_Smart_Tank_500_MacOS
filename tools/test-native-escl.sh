@@ -12,11 +12,12 @@ launchctl bootout "gui/$(id -u)/org.hp520-macos.scanbridge" 2>/dev/null
 echo "== resolving '$NAME' (_uscan._tcp)"
 RES=$( (dns-sd -L "$NAME" _uscan._tcp local. & sleep 3; kill $!) 2>/dev/null )
 ADDR=$(echo "$RES" | sed -n 's/.*can be reached at \([^ ]*\).*/\1/p' | head -1)
-RS=$(echo "$RES" | grep -o 'rs=[^ ]*' | head -1 | cut -d= -f2); RS=${RS#/}; RS=${RS:-eSCL}
+RS=$(echo "$RES" | grep -oE '(^| )rs=[^ ]*' | head -1 | sed 's/.*rs=//'); RS=${RS#/}; RS=${RS:-eSCL}
 [ -n "$ADDR" ] || { echo "not found in Bonjour"; echo "$RES"; exit 1; }
 H=${ADDR%:*}; H=${H%.}; PORT=${ADDR##*:}
 BASE="http://$H:$PORT/$RS"
 echo "address: $BASE"
+echo "$RES" | grep -E "reached|txtvers" | head -3
 
 echo "== status"
 curl -s -m 15 "$BASE/ScannerStatus" | grep -oE '<pwg:State>[^<]*|<scan:JobState>[^<]*' | head -5
