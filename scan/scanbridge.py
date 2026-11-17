@@ -108,7 +108,20 @@ class UsbHttp:
             raise LookupError("no HP printer with an IPP-over-USB interface found")
         self.dev, intf = found
         self.iface = intf.bInterfaceNumber
+        # Hold the other IPP-over-USB interfaces too, so macOS' ippusbd cannot take
+        # them: its HTTP stream gets out of step with this printer's firmware.
+        self.extra = []
+        for i in alts:
+            n = i.bInterfaceNumber
+            if cls(i) == IPP_USB and n != self.iface and n not in self.extra:
+                try:
+                    usb.util.claim_interface(self.dev, n)
+                    self.extra.append(n)
+                except usb.core.USBError:
+                    pass
         self.desc = "USB interface %d alt %d (%02x/%02x/%02x)" % ((intf.bInterfaceNumber, intf.bAlternateSetting) + cls(intf))
+        if self.extra:
+            self.desc += ", also holding interfaces " + ", ".join(map(str, self.extra))
 
         def bulk(direction):
             return usb.util.find_descriptor(intf, custom_match=lambda e:
@@ -123,6 +136,8 @@ class UsbHttp:
 
     def close(self):
         try:
+            for n in self.extra:
+                usb.util.release_interface(self.dev, n)
             usb.util.release_interface(self.dev, self.iface)
             usb.util.dispose_resources(self.dev)
         except usb.core.USBError:
