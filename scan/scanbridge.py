@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -283,9 +284,12 @@ def scanner_info(u):
     txt = {"txtvers": "1", "vers": tag("Version") or "2.0", "rs": "eSCL", "ty": model,
            "pdl": ",".join(fmts) or "image/jpeg", "cs": ",".join(cs) or "color",
            "is": ",".join(sources) or "platen", "duplex": "F", "note": "USB"}
-    if tag("UUID"):
-        txt["UUID"] = tag("UUID")
-    return model, txt
+    dev_uuid = tag("UUID")
+    # Announce our own UUID: Image Capture merges scanners with the same UUID and
+    # then keeps macOS' own USB entry (ippusbd), hiding the bridge.
+    own = str(uuid.uuid5(uuid.NAMESPACE_URL, "hp520-scanbridge:" + (dev_uuid or model)))
+    txt["UUID"] = own
+    return model, txt, dev_uuid, own
 
 
 SETTINGS = """<?xml version="1.0" encoding="UTF-8"?>
@@ -328,7 +332,7 @@ def test_scan(u, out):
 
 
 def serve(u, port, lan):
-    model, txt = scanner_info(u)
+    model, txt, dev_uuid, own_uuid = scanner_info(u)
     addr = "0.0.0.0" if lan else "127.0.0.1"
     state = {"gone": False}
 
@@ -368,6 +372,8 @@ def serve(u, port, lan):
                 ctype = dict((k.lower(), v) for k, v in hdrs).get("content-type", "")
                 log(f"  < {st} {reason} {ctype} {len(rb)} bytes"
                     + (": " + re.sub(r"\s+", " ", rb.decode("utf-8", "replace"))[:800] if st >= 400 or "xml" in ctype and self.command == "POST" else ""))
+            if dev_uuid and "xml" in dict((k.lower(), v) for k, v in hdrs).get("content-type", ""):
+                rb = rb.replace(dev_uuid.encode(), own_uuid.encode())
             self.send_response(st, reason)
             host = self.headers.get("Host") or f"127.0.0.1:{port}"
             for k, v in hdrs:
