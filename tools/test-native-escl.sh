@@ -7,7 +7,7 @@ NAME="${1:-HP Smart Tank 520_540 series}"
 OUT=~/Desktop/native-escl-test.jpg
 
 echo "== stopping the bridge, so only the macOS scanner is involved"
-launchctl bootout "gui/$(id -u)/org.hp520-macos.scanbridge" 2>/dev/null
+sudo launchctl bootout system/org.hp520-macos.scanbridge 2>/dev/null; launchctl bootout "gui/$(id -u)/org.hp520-macos.scanbridge" 2>/dev/null
 
 echo "== resolving '$NAME' (_uscan._tcp)"
 RES=$( (dns-sd -L "$NAME" _uscan._tcp local. & sleep 3; kill $!) 2>/dev/null )
@@ -50,4 +50,4 @@ done
 ls -la "$OUT" 2>/dev/null && file "$OUT"
 echo
 echo "The bridge stays stopped. Start it again with:"
-echo "  launchctl bootstrap gui/\$(id -u) /Library/LaunchAgents/org.hp520-macos.scanbridge.plist"
+echo "  sudo launchctl bootstrap system /Library/LaunchDaemons/org.hp520-macos.scanbridge.plist"

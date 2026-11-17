@@ -34,6 +34,8 @@ HP_VID = 0x03F0
 IPP_USB = (7, 1, 4)
 LIBUSB = os.environ.get("HP520_LIBUSB", os.path.join(HERE, "libusb-1.0.dylib"))
 VERBOSE = False
+LOG_DIR = "/Library/Logs" if os.geteuid() == 0 else os.path.expanduser("~/Library/Logs")
+IPPUSB_JOB = "com.apple.print.ippusb."
 HOP = {"host", "connection", "content-length", "transfer-encoding", "keep-alive",
        "accept-encoding", "te", "upgrade", "proxy-connection", "expect"}
 NS = "http://schemas.hp.com/imaging/escl/2011/05/03"
@@ -263,6 +265,27 @@ def find_native_scanner(wait=4):
     return None
 
 
+def evict_ippusbd():
+    """Remove the launchd jobs macOS submits to run ippusbd for a USB HP printer.
+
+    Their labels look like 'com.apple.print.ippusb.HP.Smart Tank 520_540 series.<serial>'.
+    Needs root. Returns the labels that were removed."""
+    if os.geteuid() != 0:
+        return []
+    try:
+        out = subprocess.run(["launchctl", "print", "system"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    labels = sorted(set(m.group(0).strip() for m in
+                        re.finditer(re.escape(IPPUSB_JOB) + r"HP\.[^\n]*", out)))
+    done = []
+    for label in labels:
+        r = subprocess.run(["launchctl", "bootout", "system/" + label], capture_output=True, text=True)
+        if r.returncode == 0:
+            done.append(label)
+    return done
+
+
 def scanner_info(u):
     """Read ScannerCapabilities and derive the Bonjour TXT record from it."""
     st, _, _, xml = u.request("GET", "/eSCL/ScannerCapabilities")
@@ -414,7 +437,7 @@ def serve(u, port, lan):
 
 def log_once(msg):
     """Log a repeating idle message only when it changes."""
-    state = os.path.expanduser("~/Library/Logs/.hp520-scanbridge.state")
+    state = os.path.join(LOG_DIR, ".hp520-scanbridge.state")
     try:
         with open(state) as f:
             last = f.read()
@@ -431,10 +454,10 @@ def log_once(msg):
 
 
 def redirect_log():
-    """Under launchd there is no terminal: write to ~/Library/Logs instead."""
+    """Under launchd there is no terminal: write to the log file instead."""
     if sys.stdout.isatty():
         return
-    path = os.path.expanduser("~/Library/Logs/hp520-scanbridge.log")
+    path = os.path.join(LOG_DIR, "hp520-scanbridge.log")
     try:
         if os.path.getsize(path) > 2 * 1024 * 1024:
             os.replace(path, path + ".1")
@@ -474,16 +497,33 @@ def main():
     if not a.test:
         redirect_log()
     try:
-        u = UsbHttp()
+        try:
+            u = UsbHttp()
+        except Busy:
+            removed = evict_ippusbd()
+            if not removed:
+                raise
+            log("took the printer back from macOS' ippusbd (removed " + ", ".join(removed) + ")")
+            u = None
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    u = UsbHttp()
+                    break
+                except Busy:
+                    continue
+            if u is None:
+                raise Busy("ippusbd did not release the printer in time")
     except LookupError as e:
         if a.test:
             sys.exit(str(e))
         if isinstance(e, Busy):
-            msg = ("macOS' own IPP-over-USB service (ippusbd) holds the printer and announces "
-                   "the scanner itself; the bridge stays idle. (" + str(e) + ")")
-            pause = 120
+            msg = ("the printer is held by another process (normally macOS' ippusbd); "
+                   + ("will retry. " if os.geteuid() == 0 else "run the bridge as root (LaunchDaemon) so it can take it back. ")
+                   + "(" + str(e) + ")")
+            pause = 10 if os.geteuid() == 0 else 120
         else:
-            msg, pause = str(e), 30
+            msg, pause = str(e), 10
         log_once(msg)
         time.sleep(pause)  # launchd starts us again and we look once more
         sys.exit(0)

@@ -15,7 +15,8 @@ BUILD="$ROOT/build"
 DEST=/Library/Printers/HPSmartTank520
 QUEUE=HP_Smart_Tank_520
 LABEL=org.hp520-macos.scanbridge
-AGENT=/Library/LaunchAgents/$LABEL.plist
+DAEMON=/Library/LaunchDaemons/$LABEL.plist
+OLD_AGENT=/Library/LaunchAgents/$LABEL.plist   # versions before the system daemon
 PORT=8095
 
 LIBUSB_V=1.0.30
@@ -91,7 +92,7 @@ if [ "$QUEUE_ONLY" = 1 ]; then
   create_queue; exit 0
 fi
 
-echo "The password is needed to install files into $DEST and /Library/LaunchAgents."
+echo "The password is needed to install files into $DEST and /Library/LaunchDaemons."
 sudo -v
 
 # ---------------------------------------------------------------- printing
@@ -137,22 +138,27 @@ if [ "$DO_SCAN" = 1 ]; then
   sudo install -o root -g wheel -m 644 "$ROOT/scan/scanbridge.py" "$DEST/scan/scanbridge.py"
   sudo install -o root -g wheel -m 755 "$U/lib/libusb-1.0.0.dylib" "$DEST/scan/libusb-1.0.dylib"
   sudo chown -R root:wheel "$DEST/scan"
-  sed -e "s#@LABEL@#$LABEL#" -e "s#@DEST@#$DEST#" -e "s#@PORT@#$PORT#" "$ROOT/scan/launchagent.plist.in" > "$BUILD/agent.plist"
-  plutil -lint "$BUILD/agent.plist" >/dev/null
-  sudo install -o root -g wheel -m 644 "$BUILD/agent.plist" "$AGENT"
+  sed -e "s#@LABEL@#$LABEL#" -e "s#@DEST@#$DEST#" -e "s#@PORT@#$PORT#" "$ROOT/scan/launchdaemon.plist.in" > "$BUILD/daemon.plist"
+  plutil -lint "$BUILD/daemon.plist" >/dev/null
+  # older versions ran the bridge as a per-user LaunchAgent
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  sudo rm -f "$OLD_AGENT"
+  sudo install -o root -g wheel -m 644 "$BUILD/daemon.plist" "$DAEMON"
+  sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
   sleep 1
-  launchctl bootstrap "gui/$(id -u)" "$AGENT"
+  sudo launchctl bootstrap system "$DAEMON"
 
   printf 'waiting for the scanner'
-  for _ in $(seq 1 15); do
+  for _ in $(seq 1 20); do
     if curl -fs "http://127.0.0.1:$PORT/eSCL/ScannerStatus" >/dev/null 2>&1; then
-      printf "\nbridge scanner is up: open Image Capture\n"; break
+      printf '\nscanner is up. In Image Capture pick "Smart Tank 520_540 series (USB)",\n'
+      printf 'not "HP Smart Tank 520_540 series" (that entry is macOS'"'"' own and does not work with this printer).\n'
+      break
     fi
     printf '.'; sleep 2
   done
   curl -fs "http://127.0.0.1:$PORT/eSCL/ScannerStatus" >/dev/null 2>&1 || \
-    printf '\nthe bridge is idle: either macOS provides the scanner itself (pick "HP Smart Tank 520_540 series"\nin Image Capture) or the printer is off/unplugged. Log: ~/Library/Logs/hp520-scanbridge.log\n'
+    printf '\nthe scanner is not answering yet (printer off or unplugged?). It starts by itself once the printer is connected.\nLog: /Library/Logs/hp520-scanbridge.log\n'
 fi
 
 step "Done"
