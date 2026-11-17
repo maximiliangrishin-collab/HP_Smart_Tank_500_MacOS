@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""eSCL (AirScan) bridge for USB-only HP Smart Tank 520/540 printers on macOS.
+
+The printer contains an eSCL scan server, but exposes it only over USB through
+an IPP-over-USB interface (class 7/1/4). This bridge opens that interface with
+libusb, serves the same HTTP API on a local TCP port and announces it via
+Bonjour as an _uscan._tcp scanner, so Image Capture, Preview and
+System Settings > Printers & Scanners can use it without any driver.
+
+    scanbridge.py              run the bridge (this Mac only, 127.0.0.1)
+    scanbridge.py --lan        also share the scanner with the local network
+    scanbridge.py --test FILE  scan one A4 page (300 dpi, colour) to FILE.jpg
+"""
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "vendor"))
+import usb.core  # noqa: E402
+import usb.util  # noqa: E402
+import usb.backend.libusb1 as libusb1  # noqa: E402
+
+HP_VID = 0x03F0
+IPP_USB = (7, 1, 4)
+LIBUSB = os.environ.get("HP520_LIBUSB", os.path.join(HERE, "libusb-1.0.dylib"))
+HOP = {"host", "connection", "content-length", "transfer-encoding", "keep-alive",
+       "accept-encoding", "te", "upgrade", "proxy-connection", "expect"}
+NS = "http://schemas.hp.com/imaging/escl/2011/05/03"
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+class UsbGone(Exception):
+    """The printer disappeared from USB; the bridge exits and launchd restarts it."""
+
+
+def dechunk(data):
+    """Return the decoded body if a chunked stream is complete, otherwise None."""
+    out, i = bytearray(), 0
+    while True:
+        j = data.find(b"\r\n", i)
+        if j < 0:
+            return None
+        n = int(data[i:j].split(b";")[0] or b"0", 16)
+        i = j + 2
+        if n == 0:
+            return bytes(out) if data.find(b"\r\n", i) >= 0 else None
+        if len(data) < i + n + 2:
+            return None
+        out += data[i:i + n]
+        i += n + 2
+
+
+class UsbHttp:
+    """One HTTP connection tunnelled through an IPP-over-USB interface."""
+
+    def __init__(self):
+        backend = libusb1.get_backend(find_library=lambda _: LIBUSB)
+        if backend is None:
+            sys.exit(f"cannot load libusb from {LIBUSB}")
+        found = None
+        for dev in usb.core.find(find_all=True, idVendor=HP_VID, backend=backend):
+            try:
+                cfg = dev.get_active_configuration()
+            except usb.core.USBError:
+                continue
+            for intf in cfg:
+                if (intf.bInterfaceClass, intf.bInterfaceSubClass, intf.bInterfaceProtocol) == IPP_USB:
+                    found = (dev, intf)
+                    break
+            if found:
+                break
+        if not found:
+            raise LookupError("no HP printer with an IPP-over-USB interface found")
+        self.dev, intf = found
+        self.iface = intf.bInterfaceNumber
+        usb.util.claim_interface(self.dev, self.iface)
+        intf.set_altsetting()
+
+        def bulk(direction):
+            return usb.util.find_descriptor(intf, custom_match=lambda e:
+                usb.util.endpoint_direction(e.bEndpointAddress) == direction and
+                usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK)
+        self.OUT, self.IN = bulk(usb.util.ENDPOINT_OUT), bulk(usb.util.ENDPOINT_IN)
+        self.lock = threading.Lock()
+        self.drain(1.0)
+
+    def close(self):
+        try:
+            usb.util.release_interface(self.dev, self.iface)
+            usb.util.dispose_resources(self.dev)
+        except usb.core.USBError:
+            pass
+
+    def drain(self, seconds=0.5):
+        """Discard any stale bytes left in the device's output queue."""
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            try:
+                self.IN.read(65536, timeout=200)
+            except usb.core.USBTimeoutError:
+                pass
+
+    def request(self, method, path, headers=None, body=b"", limit=240):
+        lines = [f"{method} {path} HTTP/1.1", "Host: localhost"]
+        for k, v in (headers or {}).items():
+            if k.lower() not in HOP:
+                lines.append(f"{k}: {v}")
+        if body or method in ("POST", "PUT"):
+            lines.append(f"Content-Length: {len(body)}")
+        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
+        with self.lock:
+            try:
+                return self._exchange(method, path, raw, limit)
+            except usb.core.USBTimeoutError:
+                raise
+            except usb.core.USBError as e:
+                raise UsbGone(str(e))
+
+    def _exchange(self, method, path, raw, limit):
+        self.OUT.write(raw, timeout=15000)
+        buf, t0, last = bytearray(), time.time(), time.time()
+        head = None
+        while time.time() - t0 < limit:
+            try:
+                chunk = self.IN.read(262144, timeout=1000)
+                if chunk:
+                    buf += bytes(chunk)
+                    last = time.time()
+            except usb.core.USBTimeoutError:
+                chunk = None
+            if head is None and b"\r\n\r\n" in buf:
+                k = buf.index(b"\r\n\r\n")
+                head, rest = bytes(buf[:k]).decode("latin-1"), k + 4
+                hl = head.lower()
+                status = int(head.split()[1])
+                chunked = "transfer-encoding: chunked" in hl
+                m = re.search(r"content-length:\s*(\d+)", hl)
+                clen = int(m.group(1)) if m else None
+            if head is not None:
+                data = bytes(buf[rest:])
+                if method == "HEAD" or status in (204, 304) or 100 <= status < 200:
+                    body = b""
+                    break
+                if chunked:
+                    body = dechunk(data)
+                    if body is not None:
+                        break
+                elif clen is not None:
+                    if len(data) >= clen:
+                        body = data[:clen]
+                        break
+                elif chunk is None and time.time() - last > 2:
+                    body = data
+                    break
+        else:
+            self.drain(1.0)
+            raise TimeoutError(f"no complete answer from the printer to {method} {path}")
+        first, *rest_lines = head.split("\r\n")
+        reason = first.split(" ", 2)[2] if first.count(" ") >= 2 else ""
+        hdrs = []
+        for line in rest_lines:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                hdrs.append((k.strip(), v.strip()))
+        return status, reason, hdrs, body
+
+
+def scanner_info(u):
+    """Read ScannerCapabilities and derive the Bonjour TXT record from it."""
+    st, _, _, xml = u.request("GET", "/eSCL/ScannerCapabilities")
+    if st != 200:
+        raise LookupError(f"printer has no eSCL scanner (HTTP {st})")
+    x = xml.decode("utf-8", "replace")
+
+    def tag(name):
+        m = re.search(rf"<(?:pwg|scan):{name}>([^<]*)<", x)
+        return m.group(1).strip() if m else ""
+    model = tag("MakeAndModel") or "HP Smart Tank"
+    modes = set(re.findall(r"<scan:ColorMode>([^<]+)<", x))
+    cs = [n for m, n in (("RGB24", "color"), ("Grayscale8", "grayscale"), ("BlackAndWhite1", "binary")) if m in modes]
+    fmts = sorted(set(re.findall(r"<(?:pwg:DocumentFormat|scan:DocumentFormatExt)>([^<]+)<", x))
+                  - {"application/octet-stream"})
+    sources = ["platen"] if "<scan:Platen>" in x else []
+    if "<scan:Adf>" in x:
+        sources.append("adf")
+    txt = {"txtvers": "1", "vers": tag("Version") or "2.0", "rs": "eSCL", "ty": model,
+           "pdl": ",".join(fmts) or "image/jpeg", "cs": ",".join(cs) or "color",
+           "is": ",".join(sources) or "platen", "duplex": "F", "note": "USB"}
+    if tag("UUID"):
+        txt["UUID"] = tag("UUID")
+    return model, txt
+
+
+SETTINGS = """<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="{ns}" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.63</pwg:Version>
+  <scan:Intent>Document</scan:Intent>
+  <pwg:ScanRegions><pwg:ScanRegion>
+    <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+    <pwg:XOffset>0</pwg:XOffset><pwg:YOffset>0</pwg:YOffset>
+    <pwg:Width>2480</pwg:Width><pwg:Height>3508</pwg:Height>
+  </pwg:ScanRegion></pwg:ScanRegions>
+  <pwg:InputSource>Platen</pwg:InputSource>
+  <scan:ColorMode>RGB24</scan:ColorMode>
+  <scan:XResolution>300</scan:XResolution><scan:YResolution>300</scan:YResolution>
+  <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+  <scan:DocumentFormatExt>image/jpeg</scan:DocumentFormatExt>
+</scan:ScanSettings>""".format(ns=NS)
+
+
+def test_scan(u, out):
+    st, _, h, _ = u.request("POST", "/eSCL/ScanJobs", {"Content-Type": "text/xml"}, SETTINGS.encode())
+    loc = dict((k.lower(), v) for k, v in h).get("location")
+    log(f"scan job: HTTP {st} {loc}")
+    if st != 201 or not loc:
+        sys.exit("the printer refused the scan job")
+    job = re.sub(r"^https?://[^/]+", "", loc).rstrip("/")
+    t0 = time.time()
+    for _ in range(180):
+        st, _, _, body = u.request("GET", job + "/NextDocument")
+        if st == 200:
+            with open(out, "wb") as f:
+                f.write(body)
+            log(f"done in {time.time() - t0:.0f} s: {out} ({len(body) // 1024} KiB)")
+            u.request("GET", job + "/NextDocument")  # lets the printer close the job (expect 404)
+            return
+        if st not in (503, 409):
+            sys.exit(f"unexpected HTTP {st} for NextDocument")
+        time.sleep(1)
+    sys.exit("no image received")
+
+
+def serve(u, port, lan):
+    model, txt = scanner_info(u)
+    addr = "0.0.0.0" if lan else "127.0.0.1"
+    state = {"gone": False}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            log("http " + (fmt % args))
+
+        def proxy(self):
+            body = b""
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                while True:
+                    n = int(self.rfile.readline().split(b";")[0], 16)
+                    if n == 0:
+                        self.rfile.readline()
+                        break
+                    body += self.rfile.read(n)
+                    self.rfile.readline()
+            elif self.headers.get("Content-Length"):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+            try:
+                st, reason, hdrs, rb = u.request(self.command, self.path, dict(self.headers), body)
+            except UsbGone as e:
+                self.send_error(503, "printer disconnected")
+                log(f"printer disconnected: {e}")
+                state["gone"] = True
+                threading.Thread(target=srv.shutdown, daemon=True).start()
+                return
+            except Exception as e:  # timeout or protocol error: keep serving
+                log(f"error on {self.command} {self.path}: {e}")
+                self.send_error(504, "printer did not answer")
+                return
+            self.send_response(st, reason)
+            host = self.headers.get("Host") or f"127.0.0.1:{port}"
+            for k, v in hdrs:
+                if k.lower() in HOP or k.lower() in ("server", "date"):
+                    continue
+                if k.lower() == "location":
+                    v = re.sub(r"^https?://[^/]+", f"http://{host}", v)
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(rb)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(rb)
+
+        do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = proxy
+
+    ThreadingHTTPServer.allow_reuse_address = True
+    srv = ThreadingHTTPServer((addr, port), Handler)
+    name = f"{model} (USB)"
+    record = [f"{k}={v}" for k, v in txt.items()]
+    if lan:
+        cmd = ["dns-sd", "-R", name, "_uscan._tcp", "local", str(port)] + record
+    else:
+        cmd = ["dns-sd", "-P", name, "_uscan._tcp", "local", str(port),
+               "hp520-scanbridge.local", "127.0.0.1"] + record
+    adv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if threading.current_thread() is threading.main_thread():  # launchd stops us with SIGTERM
+        signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=srv.shutdown, daemon=True).start())
+    log(f"bridge up: '{name}' at http://{addr}:{port}/eSCL")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        adv.terminate()
+        srv.server_close()
+    return 1 if state["gone"] else 0
+
+
+def redirect_log():
+    """Under launchd there is no terminal: write to ~/Library/Logs instead."""
+    if sys.stdout.isatty():
+        return
+    path = os.path.expanduser("~/Library/Logs/hp520-scanbridge.log")
+    try:
+        if os.path.getsize(path) > 2 * 1024 * 1024:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    f = open(path, "a", buffering=1)
+    os.dup2(f.fileno(), 1)
+    os.dup2(f.fileno(), 2)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--test", metavar="FILE", help="scan one A4 page to FILE (JPEG) and exit")
+    ap.add_argument("--lan", action="store_true", help="share the scanner with the local network")
+    ap.add_argument("--port", type=int, default=8095)
+    a = ap.parse_args()
+    if not a.test:
+        redirect_log()
+    try:
+        u = UsbHttp()
+    except LookupError as e:
+        if a.test:
+            sys.exit(str(e))
+        time.sleep(20)  # printer off or unplugged: launchd will start us again
+        sys.exit(0)
+    try:
+        if a.test:
+            test_scan(u, a.test)
+            return 0
+        return serve(u, a.port, a.lan)
+    finally:
+        u.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
