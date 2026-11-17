@@ -147,8 +147,11 @@ class UsbHttp:
             pass
         except usb.core.USBError:
             return False
+        # Compare libusb device objects, not bus/address: a printer plugged back into the
+        # same port may get the same address, but always becomes a new libusb device.
+        mine = self.dev._ctx.dev.devid.value
         try:
-            return any((d.bus, d.address) == (self.dev.bus, self.dev.address)
+            return any(d._ctx.dev.devid.value == mine
                        for d in usb.core.find(find_all=True, idVendor=HP_VID, backend=self.backend))
         except usb.core.USBError:
             return True
@@ -444,7 +447,12 @@ def serve(u, port, lan):
     def watchdog():
         while True:
             time.sleep(3)
-            if not u.present():
+            try:
+                gone = not u.present()
+            except Exception as e:  # never let the watchdog die silently
+                log(f"watchdog error: {e!r}")
+                gone = False
+            if gone:
                 log("printer disconnected; exiting so that launchd starts the bridge again")
                 adv.terminate()
                 os._exit(1)  # request threads may be stuck in USB calls: do not wait for them
